@@ -1,0 +1,570 @@
+// E-commerce platform schema.
+// Conventions:
+//   - All monetary values are stored as integer minor units (e.g. cents) + an ISO currency code.
+//   - Soft deletes via `deletedAt` where records must remain referenceable by historical orders.
+//   - `metadata` Json columns are reserved extension points (AI features, integrations, experiments).
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  // `vector` is pre-declared for future AI features (product/embedding similarity search).
+  extensions = [citext, vector]
+}
+
+// ─────────────────────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────────────────────
+
+enum Role {
+  GUEST
+  CUSTOMER
+  ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  INVITED
+  SUSPENDED
+  DEACTIVATED
+}
+
+enum AuthProvider {
+  CREDENTIALS
+  GOOGLE
+}
+
+enum ProductStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+enum AddressType {
+  SHIPPING
+  BILLING
+}
+
+enum CartStatus {
+  ACTIVE
+  CONVERTED
+  ABANDONED
+}
+
+enum OrderStatus {
+  PENDING
+  PAID
+  FULFILLED
+  COMPLETED
+  CANCELLED
+}
+
+enum PaymentStatus {
+  REQUIRES_PAYMENT
+  PROCESSING
+  SUCCEEDED
+  FAILED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+enum FulfillmentStatus {
+  UNFULFILLED
+  PARTIALLY_FULFILLED
+  FULFILLED
+}
+
+enum RefundStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+}
+
+enum ReturnStatus {
+  REQUESTED
+  APPROVED
+  REJECTED
+  RECEIVED
+  REFUNDED
+}
+
+// ─────────────────────────────────────────────────────────────
+// Identity & auth
+// ─────────────────────────────────────────────────────────────
+
+model User {
+  id              String     @id @default(uuid()) @db.Uuid
+  email           String     @unique @db.Citext
+  passwordHash    String?
+  role            Role       @default(CUSTOMER)
+  status          UserStatus @default(ACTIVE)
+  firstName       String?
+  lastName        String?
+  phone           String?
+  avatarUrl       String?
+  emailVerifiedAt DateTime?
+  lastLoginAt     DateTime?
+  metadata        Json       @default("{}")
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+  deletedAt       DateTime?
+
+  oauthAccounts      OAuthAccount[]
+  refreshTokens      RefreshToken[]
+  verificationTokens VerificationToken[]
+  addresses          Address[]
+  carts              Cart[]
+  orders             Order[]
+  reviews            ProductReview[]
+  auditLogs          AuditLog[]          @relation("AuditActor")
+
+  @@index([role, status])
+  @@index([deletedAt])
+  @@map("users")
+}
+
+model OAuthAccount {
+  id                String       @id @default(uuid()) @db.Uuid
+  provider          AuthProvider
+  providerAccountId String
+  user              User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId            String       @db.Uuid
+  createdAt         DateTime     @default(now())
+
+  @@unique([provider, providerAccountId])
+  @@index([userId])
+  @@map("oauth_accounts")
+}
+
+// Opaque, long-lived refresh tokens. Only the hash is persisted; rotation is tracked
+// via `replacedById` so a reused (stolen) token can invalidate its lineage.
+model RefreshToken {
+  id           String    @id @default(uuid()) @db.Uuid
+  tokenHash    String    @unique
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId       String    @db.Uuid
+  userAgent    String?
+  ipAddress    String?
+  expiresAt    DateTime
+  revokedAt    DateTime?
+  replacedById String?   @db.Uuid
+  createdAt    DateTime  @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+enum VerificationPurpose {
+  EMAIL_VERIFICATION
+  PASSWORD_RESET
+}
+
+model VerificationToken {
+  id         String              @id @default(uuid()) @db.Uuid
+  tokenHash  String              @unique
+  purpose    VerificationPurpose
+  user       User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId     String              @db.Uuid
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime            @default(now())
+
+  @@index([userId, purpose])
+  @@map("verification_tokens")
+}
+
+model Address {
+  id         String      @id @default(uuid()) @db.Uuid
+  user       User?       @relation(fields: [userId], references: [id], onDelete: SetNull)
+  userId     String?     @db.Uuid
+  type       AddressType
+  isDefault  Boolean     @default(false)
+  fullName   String
+  company    String?
+  line1      String
+  line2      String?
+  city       String
+  region     String?
+  postalCode String
+  country    String
+  phone      String?
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+
+  @@index([userId])
+  @@map("addresses")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Catalog
+// ─────────────────────────────────────────────────────────────
+
+model Category {
+  id          String     @id @default(uuid()) @db.Uuid
+  name        String
+  slug        String     @unique
+  description String?
+  imageUrl    String?
+  position    Int        @default(0)
+  isActive    Boolean    @default(true)
+  parent      Category?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: SetNull)
+  parentId    String?    @db.Uuid
+  children    Category[] @relation("CategoryTree")
+  products    Product[]
+  metadata    Json       @default("{}")
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+  deletedAt   DateTime?
+
+  @@index([parentId])
+  @@index([isActive])
+  @@map("categories")
+}
+
+model Product {
+  id             String                       @id @default(uuid()) @db.Uuid
+  name           String
+  slug           String                       @unique
+  description    String?
+  status         ProductStatus                @default(DRAFT)
+  category       Category?                    @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  categoryId     String?                      @db.Uuid
+  brand          String?
+  // Free-form, structured attributes (color, material, dimensions...) — also feeds future
+  // AI enrichment, search, and recommendations.
+  attributes     Json                         @default("{}")
+  metadata       Json                         @default("{}")
+  publishedAt    DateTime?
+  // Retrieval layer. `searchVector` is kept up to date by the catalog-indexing worker;
+  // `embedding` is reserved for the upcoming AI phase (semantic search / recommendations).
+  searchVector   Unsupported("tsvector")?
+  embedding      Unsupported("vector(384)")?
+  embeddingModel String?
+  indexedAt      DateTime?
+  createdAt      DateTime                     @default(now())
+  updatedAt      DateTime                     @updatedAt
+  deletedAt      DateTime?
+
+  images   ProductImage[]
+  variants ProductVariant[]
+  reviews  ProductReview[]
+
+  @@index([status])
+  @@index([categoryId])
+  @@index([deletedAt])
+  @@index([searchVector], type: Gin)
+  @@map("products")
+}
+
+model ProductImage {
+  id        String   @id @default(uuid()) @db.Uuid
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  productId String   @db.Uuid
+  url       String
+  alt       String?
+  position  Int      @default(0)
+  createdAt DateTime @default(now())
+
+  @@index([productId])
+  @@map("product_images")
+}
+
+model ProductVariant {
+  id                String   @id @default(uuid()) @db.Uuid
+  product           Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  productId         String   @db.Uuid
+  sku               String   @unique
+  name              String
+  priceAmount       Int
+  compareAtAmount   Int?
+  currency          String   @default("usd")
+  inventoryQuantity Int      @default(0)
+  // Held by unpaid orders during checkout; available = inventoryQuantity - reservedQuantity.
+  reservedQuantity  Int      @default(0)
+  weightGrams       Int?
+  barcode           String?
+  options           Json     @default("{}")
+  isActive          Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  cartItems  CartItem[]
+  orderItems OrderItem[]
+
+  @@index([productId])
+  @@map("product_variants")
+}
+
+model ProductReview {
+  id        String   @id @default(uuid()) @db.Uuid
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  productId String   @db.Uuid
+  author    User?    @relation(fields: [authorId], references: [id], onDelete: SetNull)
+  authorId  String?  @db.Uuid
+  rating    Int
+  title     String?
+  body      String?
+  // Reserved for future AI moderation / sentiment scoring.
+  metadata  Json     @default("{}")
+  createdAt DateTime @default(now())
+
+  @@index([productId])
+  @@map("product_reviews")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Cart & checkout
+// ─────────────────────────────────────────────────────────────
+
+model Cart {
+  id         String     @id @default(uuid()) @db.Uuid
+  // Either an authenticated customer or an anonymous guest token.
+  user       User?      @relation(fields: [userId], references: [id], onDelete: SetNull)
+  userId     String?    @db.Uuid
+  guestToken String?    @unique
+  status     CartStatus @default(ACTIVE)
+  currency   String     @default("usd")
+  metadata   Json       @default("{}")
+  createdAt  DateTime   @default(now())
+  updatedAt  DateTime   @updatedAt
+
+  items CartItem[]
+  order Order?
+
+  @@index([userId])
+  @@map("carts")
+}
+
+model CartItem {
+  id         String         @id @default(uuid()) @db.Uuid
+  cart       Cart           @relation(fields: [cartId], references: [id], onDelete: Cascade)
+  cartId     String         @db.Uuid
+  variant    ProductVariant @relation(fields: [variantId], references: [id], onDelete: Restrict)
+  variantId  String         @db.Uuid
+  quantity   Int
+  // Price captured at add-to-cart time; reconciled at checkout.
+  unitAmount Int
+  createdAt  DateTime       @default(now())
+  updatedAt  DateTime       @updatedAt
+
+  @@unique([cartId, variantId])
+  @@index([cartId])
+  @@map("cart_items")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Orders, payments, fulfillment
+// ─────────────────────────────────────────────────────────────
+
+model Order {
+  id          String  @id @default(uuid()) @db.Uuid
+  orderNumber String  @unique
+  customer    User?   @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  customerId  String? @db.Uuid
+  email       String  @db.Citext
+  cart        Cart?   @relation(fields: [cartId], references: [id], onDelete: SetNull)
+  cartId      String? @unique @db.Uuid
+
+  status            OrderStatus       @default(PENDING)
+  paymentStatus     PaymentStatus     @default(REQUIRES_PAYMENT)
+  fulfillmentStatus FulfillmentStatus @default(UNFULFILLED)
+
+  currency       String @default("usd")
+  subtotalAmount Int    @default(0)
+  discountAmount Int    @default(0)
+  taxAmount      Int    @default(0)
+  shippingAmount Int    @default(0)
+  totalAmount    Int    @default(0)
+  refundedAmount Int    @default(0)
+
+  shippingAddress Json?
+  billingAddress  Json?
+  customerNote    String?
+  metadata        Json    @default("{}")
+
+  placedAt    DateTime?
+  cancelledAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  items    OrderItem[]
+  payments Payment[]
+  refunds  Refund[]
+  returns  Return[]
+  events   OrderEvent[]
+
+  @@index([customerId])
+  @@index([status])
+  @@index([paymentStatus])
+  @@index([createdAt])
+  @@map("orders")
+}
+
+// Line items snapshot product/variant data so historical orders are immutable even if
+// the catalog changes later.
+model OrderItem {
+  id          String          @id @default(uuid()) @db.Uuid
+  order       Order           @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  orderId     String          @db.Uuid
+  variant     ProductVariant? @relation(fields: [variantId], references: [id], onDelete: SetNull)
+  variantId   String?         @db.Uuid
+  productName String
+  variantName String
+  sku         String
+  unitAmount  Int
+  quantity    Int
+  totalAmount Int
+  metadata    Json            @default("{}")
+
+  returnItems ReturnItem[]
+
+  @@index([orderId])
+  @@map("order_items")
+}
+
+model Payment {
+  id          String        @id @default(uuid()) @db.Uuid
+  order       Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  orderId     String        @db.Uuid
+  provider    String        @default("stripe")
+  providerRef String?       @unique
+  status      PaymentStatus @default(REQUIRES_PAYMENT)
+  amount      Int
+  currency    String        @default("usd")
+  metadata    Json          @default("{}")
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  refunds Refund[]
+
+  @@index([orderId])
+  @@map("payments")
+}
+
+model Refund {
+  id             String       @id @default(uuid()) @db.Uuid
+  order          Order        @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  orderId        String       @db.Uuid
+  payment        Payment?     @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+  paymentId      String?      @db.Uuid
+  providerRef    String?      @unique
+  idempotencyKey String?      @unique
+  amount         Int
+  reason         String?
+  status         RefundStatus @default(PENDING)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  @@index([orderId])
+  @@index([status])
+  @@map("refunds")
+}
+
+model Return {
+  id        String       @id @default(uuid()) @db.Uuid
+  order     Order        @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  orderId   String       @db.Uuid
+  status    ReturnStatus @default(REQUESTED)
+  reason    String?
+  note      String?
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+
+  items ReturnItem[]
+
+  @@index([orderId])
+  @@map("returns")
+}
+
+model ReturnItem {
+  id          String    @id @default(uuid()) @db.Uuid
+  return      Return    @relation(fields: [returnId], references: [id], onDelete: Cascade)
+  returnId    String    @db.Uuid
+  orderItem   OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Restrict)
+  orderItemId String    @db.Uuid
+  quantity    Int
+
+  @@index([returnId])
+  @@map("return_items")
+}
+
+// Append-only timeline of everything that happens to an order — powers the admin
+// activity feed and is a clean training/grounding source for future AI agents.
+model OrderEvent {
+  id        String   @id @default(uuid()) @db.Uuid
+  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  orderId   String   @db.Uuid
+  type      String
+  message   String?
+  data      Json     @default("{}")
+  createdAt DateTime @default(now())
+
+  @@index([orderId])
+  @@map("order_events")
+}
+
+// ─────────────────────────────────────────────────────────────
+// Operational
+// ─────────────────────────────────────────────────────────────
+
+model AuditLog {
+  id         String   @id @default(uuid()) @db.Uuid
+  actor      User?    @relation("AuditActor", fields: [actorId], references: [id], onDelete: SetNull)
+  actorId    String?  @db.Uuid
+  action     String
+  entityType String
+  entityId   String?
+  data       Json     @default("{}")
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([actorId])
+  @@map("audit_logs")
+}
+
+enum AnalyticsEventType {
+  PRODUCT_VIEWED
+  PRODUCT_SEARCHED
+  CART_ITEM_ADDED
+  CHECKOUT_STARTED
+  ORDER_PLACED
+}
+
+// Append-only behavioral stream. Intentionally decoupled (scalar references, no FKs) so
+// events survive entity deletion and can be streamed to a warehouse. This is the signal
+// source for the upcoming recommendation / personalization features.
+model AnalyticsEvent {
+  id          String             @id @default(uuid()) @db.Uuid
+  type        AnalyticsEventType
+  userId      String?            @db.Uuid
+  anonymousId String?
+  sessionId   String?
+  productId   String?            @db.Uuid
+  variantId   String?            @db.Uuid
+  data        Json               @default("{}")
+  createdAt   DateTime           @default(now())
+
+  @@index([type, createdAt])
+  @@index([userId])
+  @@index([productId])
+  @@index([anonymousId])
+  @@map("analytics_events")
+}
+
+// Dedup ledger for inbound provider webhooks. The unique `eventId` makes processing
+// of an at-least-once delivery channel exactly-once.
+model WebhookEvent {
+  id          String   @id @default(uuid()) @db.Uuid
+  provider    String   @default("stripe")
+  eventId     String
+  type        String
+  processedAt DateTime @default(now())
+
+  @@unique([provider, eventId])
+  @@map("webhook_events")
+}
